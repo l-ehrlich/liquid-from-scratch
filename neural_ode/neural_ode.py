@@ -26,9 +26,9 @@ class NeuralODENetwork(nn.Module):
 
         hidden_states = self._solver.solve(initial_state, self._latent_dynamics_function)
 
-        last_hidden_state = hidden_states[-1]
+        last_hidden_states = hidden_states[:, -1]
 
         if self._task_head is not None:
-            return self._task_head(last_hidden_state)
+            return self._task_head(last_hidden_states)
 
-        return last_hidden_state
+        return last_hidden_states

@@ -7,9 +7,11 @@ from torch import nn
 def _rk45_get_states(initial_state: torch.Tensor, dynamics_function: nn.Module, t: torch.Tensor, step_size: float) -> torch.Tensor:
 
     state = initial_state
-    batch_size = initial_state.shape[0]
 
-    time_tensor = t.repeat(batch_size, 1)
+    # Break up singletons
+    time_tensor = t.unsqueeze(1) 
+    step_size = step_size.unsqueeze(1)
+
     state_time_tensor = torch.cat((time_tensor, state), dim=1)
     k1 = dynamics_function(state_time_tensor)
 
@@ -56,17 +58,18 @@ class RK45Solver(BaseODESolver):
     def solve(self, initial_state: torch.Tensor, dynamics_function: nn.Module) -> torch.Tensor:
         state = initial_state
         batch_size = initial_state.shape[0]
+        step_size_tensor = self._step_size.repeat(batch_size)
 
-        states = torch.zeros(self._timesteps_number, batch_size, *initial_state.shape[1:])
-        states[0] = initial_state
+        states = torch.zeros(batch_size, self._timesteps_number,  *initial_state.shape[1:])
+        states[:, 0] = initial_state
 
         # todo: Include table of coefficients as a parameter
         for i, t in enumerate(self._timesteps):
 
-            k1, _, k3, k4, k5, k6 = _rk45_get_states(state, dynamics_function, t, self._step_size)
+            k1, _, k3, k4, k5, k6 = _rk45_get_states(state, dynamics_function, t.repeat(batch_size), step_size_tensor)
 
             state = state + k1 * 47 / 450 + k3 * 12 / 25 + k4 * 32 / 225 + k5 / 30 + k6 * -6 / 25
-            states[i] = state
+            states[:, i] = state
 
         return states
     
@@ -86,40 +89,88 @@ class AdaptiveRK45Solver(BaseODESolver):
         self._buffer_size = int(self._time_range[-1] // self._min_step_size) + 1
 
     def solve(self, initial_state: torch.Tensor, dynamics_function: nn.Module) -> torch.Tensor:
+        
         state = initial_state
         batch_size = initial_state.shape[0]
 
-        assert batch_size == 1, "Batch size must be 1 for adaptive solvers"
+        # assert batch_size == 1, "Batch size must be 1 for adaptive solvers"
 
         # The length of the states array is unknown, so we need to initialize it with a large enough number
-        states = torch.zeros(self._buffer_size, batch_size, *initial_state.shape[1:])
-        states[0] = initial_state
+        states = torch.zeros(batch_size, self._buffer_size, *initial_state.shape[1:])
+        states[:, 0] = initial_state
 
-        current_time = torch.tensor(self._time_range[0], dtype=torch.float)
-        current_index = 0
+        current_times = torch.tensor(self._time_range[0], dtype=torch.float).repeat(batch_size)
+        current_indices = torch.zeros(batch_size, dtype=torch.int)
 
-        step_size = torch.tensor(self._step_size, dtype=torch.float)
-        tolerances_tensor = self._error_tolerance.repeat(batch_size)
+        step_sizes_tensor = torch.tensor(self._step_size, dtype=torch.float).repeat(batch_size)
 
-        # todo: Come up with a method to do adaptive step batchwise (different state lengths for different inputs)
-        while current_time < self._time_range[1]:
-            k1, _, k3, k4, k5, k6 = _rk45_get_states(state, dynamics_function, current_time, step_size)
+        # While processing ODEs batchwise with the adaptive step size, every input can have a different
+        # number of timesteps to complete, therefore making things complicated. We will use a mask tensor
+        # marking which states are completed and which are not.
+        active_ode_mask = torch.ones(batch_size, dtype=torch.bool)
 
-            error = torch.norm(k1 / 150 + k3 * -3 / 100 + k4 * 16 / 75 + k5 / 20 + k6 * -6 / 25)
-            new_step_size = 0.9 * step_size * (self._error_tolerance / error) ** (1 / 5)
+        while active_ode_mask.any():
 
-            if error > tolerances_tensor:
-                step_size = new_step_size
-                continue
-
-            else:
-                step_size = new_step_size
-                step_size = torch.clamp(step_size, min=self._min_step_size, max=self._max_step_size)
-
-            state = state + k1 * 47 / 450 + k3 * 12 / 25 + k4 * 32 / 225 + k5 / 30 + k6 * -6 / 25
+            active_mask = active_ode_mask.clone()
+            active_states = state[active_mask]
+            active_step_sizes = step_sizes_tensor[active_mask]
+            active_times = current_times[active_mask]
             
-            states[current_index] = state
-            current_index += 1
-            current_time += step_size
+            k1, _, k3, k4, k5, k6 = _rk45_get_states(active_states, dynamics_function, active_times, active_step_sizes)
 
-        return states[:current_index]
+            errors = torch.norm(k1 / 150 + k3 * -3 / 100 + k4 * 16 / 75 + k5 / 20 + k6 * -6 / 25, dim=1)
+            new_step_sizes = 0.9 * active_step_sizes * (self._error_tolerance / errors) ** (1 / 5)
+
+            repeat_mask = errors > self._error_tolerance
+            continue_mask = ~repeat_mask
+
+            step_sizes_tensor[active_mask] = torch.clamp(new_step_sizes, min=self._min_step_size, max=self._max_step_size)
+
+            if continue_mask.any():
+                new_states = (active_states[continue_mask] +
+                              k1[continue_mask] * 47 / 450 +
+                              k3[continue_mask] * 12 / 25 +
+                              k4[continue_mask] * 32 / 225 +
+                              k5[continue_mask] / 30 +
+                              k6[continue_mask] * -6 / 25)
+                
+                active_indices = torch.where(active_mask)[0]
+                update_batch_indices = active_indices[continue_mask]
+                state_indices_to_update = current_indices[update_batch_indices]
+
+                states[update_batch_indices, state_indices_to_update] = new_states
+                
+                current_times[update_batch_indices] = current_times[update_batch_indices] + active_step_sizes[continue_mask]
+                current_indices[update_batch_indices] = current_indices[update_batch_indices] + 1
+
+                ode_solved_mask = current_times[update_batch_indices] >= self._time_range[1]
+                solved_indices = update_batch_indices[ode_solved_mask]
+                active_ode_mask[solved_indices] = False
+        
+        current_indices = current_indices.unsqueeze(1)
+
+        return states[:, :current_indices.max()]
+
+        # # todo: Come up with a method to do adaptive step batchwise (different state lengths for different inputs)
+        # while current_time < self._time_range[1]:
+        #     k1, _, k3, k4, k5, k6 = _rk45_get_states(state, dynamics_function, current_time, step_size)
+
+        #     error = torch.norm(k1 / 150 + k3 * -3 / 100 + k4 * 16 / 75 + k5 / 20 + k6 * -6 / 25)
+        #     new_step_size = 0.9 * step_size * (self._error_tolerance / error) ** (1 / 5)
+
+        #     if error > tolerances_tensor:
+        #         step_size = new_step_size
+        #         step_size = torch.clamp(step_size, min=self._min_step_size, max=self._max_step_size)
+        #         continue
+
+        #     else:
+        #         step_size = new_step_size
+        #         step_size = torch.clamp(step_size, min=self._min_step_size, max=self._max_step_size)
+
+        #     state = state + k1 * 47 / 450 + k3 * 12 / 25 + k4 * 32 / 225 + k5 / 30 + k6 * -6 / 25
+            
+        #     states[current_index] = state
+        #     current_index += 1
+        #     current_time += step_size
+
+        # return states[:current_index]
