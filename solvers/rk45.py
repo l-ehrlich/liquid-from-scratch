@@ -75,7 +75,7 @@ class AdaptiveRK45Solver(BaseODESolver):
     """
     Runge-Kutta-Fehlberg solver for ODEs with adaptive step size. Solves ODEs batchwise.
     """
-    def __init__(self, time_range: Tuple[float, float], max_step_size: float, min_step_size: float, error_tolerance: float = 1e-6):
+    def __init__(self, time_range: Tuple[float, float], max_step_size: float, min_step_size: float, error_tolerance: float = 1e-3):
         super(AdaptiveRK45Solver, self).__init__()
         self._time_range = time_range
         self._max_step_size = torch.tensor(max_step_size)
@@ -83,37 +83,43 @@ class AdaptiveRK45Solver(BaseODESolver):
         self._error_tolerance = torch.tensor(error_tolerance)
 
         self._step_size = self._max_step_size
+        self._buffer_size = int(self._time_range[-1] // self._min_step_size) + 1
 
     def solve(self, initial_state: torch.Tensor, dynamics_function: nn.Module) -> torch.Tensor:
         state = initial_state
         batch_size = initial_state.shape[0]
 
+        assert batch_size == 1, "Batch size must be 1 for adaptive solvers"
+
         # The length of the states array is unknown, so we need to initialize it with a large enough number
-        states = torch.zeros(10000, batch_size, *initial_state.shape[1:])
+        states = torch.zeros(self._buffer_size, batch_size, *initial_state.shape[1:])
         states[0] = initial_state
 
-        current_time = torch.tensor(self._time_range[0])
+        current_time = torch.tensor(self._time_range[0], dtype=torch.float)
         current_index = 0
 
-        step_size = torch.tensor(self._step_size)
+        step_size = torch.tensor(self._step_size, dtype=torch.float)
+        tolerances_tensor = self._error_tolerance.repeat(batch_size)
 
+        # todo: Come up with a method to do adaptive step batchwise (different state lengths for different inputs)
         while current_time < self._time_range[1]:
             k1, _, k3, k4, k5, k6 = _rk45_get_states(state, dynamics_function, current_time, step_size)
 
-            error = torch.abs(k1 / 150 + k3 * -3 / 100 + k4 * 16 / 75 + k5 / 20 + k6 * -6 / 25)
+            error = torch.norm(k1 / 150 + k3 * -3 / 100 + k4 * 16 / 75 + k5 / 20 + k6 * -6 / 25)
             new_step_size = 0.9 * step_size * (self._error_tolerance / error) ** (1 / 5)
 
-            if error > self._error_tolerance:
+            if error > tolerances_tensor:
                 step_size = new_step_size
                 continue
 
             else:
                 step_size = new_step_size
-
-            step_size = torch.clamp(step_size, min=self._min_step_size, max=self._max_step_size)
+                step_size = torch.clamp(step_size, min=self._min_step_size, max=self._max_step_size)
 
             state = state + k1 * 47 / 450 + k3 * 12 / 25 + k4 * 32 / 225 + k5 / 30 + k6 * -6 / 25
             
             states[current_index] = state
             current_index += 1
             current_time += step_size
+
+        return states[:current_index]
