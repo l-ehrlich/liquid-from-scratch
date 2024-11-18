@@ -96,7 +96,7 @@ class RK45Solver(BaseODESolver):
         # todo: Include table of coefficients as a parameter
         for i, t in enumerate(self._timesteps):
 
-            k1, _, k3, k4, k5, k6 = _rk45_get_states(state, dynamics_function, t.repeat(batch_size), step_size_tensor)
+            k1, _, k3, k4, k5, k6 = _rk45_get_states(state, dynamics_function, t.repeat(batch_size), step_size_tensor, self._include_state_in_dynamics)
 
             state = state + k1 * 47 / 450 + k3 * 12 / 25 + k4 * 32 / 225 + k5 / 30 + k6 * -6 / 25
             states[:, i] = state
@@ -120,7 +120,7 @@ class AdaptiveRK45Solver(BaseODESolver):
         self._include_state_in_dynamics = include_state_in_dynamics
 
     def solve(self, initial_state: torch.Tensor, dynamics_function: nn.Module) -> torch.Tensor:
-        state = initial_state
+        state = initial_state.clone()
         batch_size = initial_state.shape[0]
         
         states = torch.zeros(batch_size, self._buffer_size, *initial_state.shape[1:])
