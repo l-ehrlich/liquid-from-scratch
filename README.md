@@ -1,1 +1,1 @@
-# liquid-from-scratch
+# Numerical deep learning playground
