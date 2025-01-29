@@ -20,13 +20,22 @@ class NeuralODENetwork(nn.Module):
     def attach_task_head(self, task_head: nn.Module):
         self._task_head = task_head
 
+    def forward_hidden_states(self, initial_state: torch.Tensor):
+        if self._pre_solver_function is not None:
+            initial_state = self._pre_solver_function(initial_state)
+
+        hidden_states = self._solver.solve(initial_state, self._latent_dynamics_function)
+        return hidden_states
+
     def forward(self, initial_state: torch.Tensor, ):
         if self._pre_solver_function is not None:
             initial_state = self._pre_solver_function(initial_state)
 
         hidden_states = self._solver.solve(initial_state, self._latent_dynamics_function)
 
-        last_hidden_states = hidden_states[:, -1]
+        print("Timesteps: ", hidden_states.shape[1])
+
+        last_hidden_states = hidden_states[:, -1, :]
 
         if self._task_head is not None:
             return self._task_head(last_hidden_states)
